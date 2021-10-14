@@ -1,13 +1,11 @@
 pragma solidity 0.6.4;
 pragma experimental ABIEncoderV2;
 
-import "@openzeppelin/contracts/access/AccessControl.sol";
+import "./utils/AccessControl.sol";
 import "./utils/Pausable.sol";
 import "./utils/SafeMath.sol";
-import "./interfaces/IDepositExecute.sol";
+import "./interfaces/IBridgeHandler.sol";
 import "./interfaces/IBridge.sol";
-import "./interfaces/IERCHandler.sol";
-import "./interfaces/IGenericHandler.sol";
 
 /**
     @title Facilitates deposits, creation and votiing of deposit proposals, and deposit executions.
@@ -15,58 +13,57 @@ import "./interfaces/IGenericHandler.sol";
  */
 contract Bridge is Pausable, AccessControl, SafeMath {
 
-    uint8   public _chainID;
+    uint8 public _chainID;
     uint256 public _relayerThreshold;
-    uint256 public _totalRelayers;
-    uint256 public _totalProposals;
     uint256 public _fee;
     uint256 public _expiry;
 
-    enum Vote {No, Yes}
-
     enum ProposalStatus {Inactive, Active, Passed, Executed, Cancelled}
 
+    // Limit relayers number because proposal can fit only so much votes
+    uint256 constant public MAX_RELAYERS = 200;
+
     struct Proposal {
-        bytes32 _resourceID;
-        bytes32 _dataHash;
-        address[] _yesVotes;
-        address[] _noVotes;
         ProposalStatus _status;
-        uint256 _proposedBlock;
+        uint200 _yesVotes;      // bitmap, 200 maximum votes
+        uint8   _yesVotesTotal;
+        uint40  _proposedBlock; // 1099511627775 maximum block
     }
 
     // destinationChainID => number of deposits
     mapping(uint8 => uint64) public _depositCounts;
     // resourceID => handler address
     mapping(bytes32 => address) public _resourceIDToHandlerAddress;
-    // depositNonce => destinationChainID => bytes
-    mapping(uint64 => mapping(uint8 => bytes)) public _depositRecords;
-    // destinationChainID + depositNonce => dataHash => Proposal
-    mapping(uint72 => mapping(bytes32 => Proposal)) public _proposals;
-    // destinationChainID + depositNonce => dataHash => relayerAddress => bool
-    mapping(uint72 => mapping(bytes32 => mapping(address => bool))) public _hasVotedOnProposal;
+    // depositKey => Proposal
+    mapping(bytes32 => Proposal) public _proposals;
 
     event RelayerThresholdChanged(uint indexed newThreshold);
     event RelayerAdded(address indexed relayer);
     event RelayerRemoved(address indexed relayer);
     event Deposit(
-        uint8   indexed destinationChainID,
-        bytes32 indexed resourceID,
-        uint64  indexed depositNonce
+	bytes32 indexed executor,
+        bytes32 depositKey,
+        uint8 destinationChainID,
+        uint64 depositNonce,
+        bytes32 resourceID,
+	bytes data
     );
     event ProposalEvent(
-        uint8           indexed originChainID,
-        uint64          indexed depositNonce,
-        ProposalStatus  indexed status,
-        bytes32 resourceID,
-        bytes32 dataHash
+	bytes32 indexed depositKey,
+        ProposalStatus  status
     );
 
     event ProposalVote(
-        uint8   indexed originChainID,
-        uint64  indexed depositNonce,
-        ProposalStatus indexed status,
-        bytes32 resourceID
+        bytes32 indexed depositKey,
+        ProposalStatus status
+    );
+
+    event Execute(
+        bytes32 indexed executor,
+        bytes32 indexed depositKey,
+        uint8   originChainID,
+        uint8   destinationChainID,
+        bytes   data
     );
 
     bytes32 public constant RELAYER_ROLE = keccak256("RELAYER_ROLE");
@@ -86,16 +83,16 @@ contract Bridge is Pausable, AccessControl, SafeMath {
         _;
     }
 
-    function _onlyAdminOrRelayer() private {
+    function _onlyAdminOrRelayer() private view {
         require(hasRole(DEFAULT_ADMIN_ROLE, msg.sender) || hasRole(RELAYER_ROLE, msg.sender),
             "sender is not relayer or admin");
     }
 
-    function _onlyAdmin() private {
+    function _onlyAdmin() private view {
         require(hasRole(DEFAULT_ADMIN_ROLE, msg.sender), "sender doesn't have admin role");
     }
 
-    function _onlyRelayers() private {
+    function _onlyRelayers() private view {
         require(hasRole(RELAYER_ROLE, msg.sender), "sender doesn't have relayer role");
     }
 
@@ -117,9 +114,7 @@ contract Bridge is Pausable, AccessControl, SafeMath {
 
         for (uint i; i < initialRelayers.length; i++) {
             grantRole(RELAYER_ROLE, initialRelayers[i]);
-            _totalRelayers++;
         }
-
     }
 
     /**
@@ -128,6 +123,15 @@ contract Bridge is Pausable, AccessControl, SafeMath {
      */
     function isRelayer(address relayer) external view returns (bool) {
         return hasRole(RELAYER_ROLE, relayer);
+    }
+
+    /**
+        @notice Returns true if {relayer} has voted on {destNonce} {dataHash} proposal.
+        @param depositKey see {_getDepositKey}.
+        @param relayer Address to check.
+     */
+    function _hasVotedOnProposal(bytes32 depositKey, address relayer) public view returns(bool) {
+        return _hasVoted(_proposals[depositKey], relayer);
     }
 
     /**
@@ -168,90 +172,79 @@ contract Bridge is Pausable, AccessControl, SafeMath {
     }
 
     /**
-        @notice Grants {relayerAddress} the relayer role and increases {_totalRelayer} count.
+        @notice Grants {relayerAddress} the relayer role.
         @notice Only callable by an address that currently has the admin role.
+        @notice Admin role is checked in grantRole
         @param relayerAddress Address of relayer to be added.
         @notice Emits {RelayerAdded} event.
      */
-    function adminAddRelayer(address relayerAddress) external onlyAdmin {
-        require(!hasRole(RELAYER_ROLE, relayerAddress), "addr already has relayer role!");
+    function adminAddRelayer(address relayerAddress) external {
+	require(getRoleMemberCount(RELAYER_ROLE) < MAX_RELAYERS, 'Max relayers reached');
+        require(!hasRole(RELAYER_ROLE, relayerAddress), "Already registered!");
         grantRole(RELAYER_ROLE, relayerAddress);
         emit RelayerAdded(relayerAddress);
-        _totalRelayers++;
     }
 
     /**
         @notice Removes relayer role for {relayerAddress} and decreases {_totalRelayer} count.
         @notice Only callable by an address that currently has the admin role.
+        @notice Admin role is checked in revokeRole
         @param relayerAddress Address of relayer to be removed.
         @notice Emits {RelayerRemoved} event.
      */
-    function adminRemoveRelayer(address relayerAddress) external onlyAdmin {
-        require(hasRole(RELAYER_ROLE, relayerAddress), "addr doesn't have relayer role!");
+    function adminRemoveRelayer(address relayerAddress) external {
+        require(hasRole(RELAYER_ROLE, relayerAddress), "Not registered!");
         revokeRole(RELAYER_ROLE, relayerAddress);
         emit RelayerRemoved(relayerAddress);
-        _totalRelayers--;
     }
 
     /**
-        @notice Sets a new resource for handler contracts that use the IERCHandler interface,
-        and maps the {handlerAddress} to {resourceID} in {_resourceIDToHandlerAddress}.
+        @notice Maps the {handlerAddress} to {resourceID} in {_resourceIDToHandlerAddress}.
         @notice Only callable by an address that currently has the admin role.
         @param handlerAddress Address of handler resource will be set for.
+
         @param resourceID ResourceID to be used when making deposits.
         @param tokenAddress Address of contract to be called when a deposit is made and a deposited is executed.
      */
     function adminSetResource(address handlerAddress, bytes32 resourceID, address tokenAddress) external onlyAdmin {
         _resourceIDToHandlerAddress[resourceID] = handlerAddress;
-        IERCHandler handler = IERCHandler(handlerAddress);
-        handler.setResource(resourceID, tokenAddress);
-    }
-
-    /**
-        @notice Sets a new resource for handler contracts that use the IGenericHandler interface,
-        and maps the {handlerAddress} to {resourceID} in {_resourceIDToHandlerAddress}.
-        @notice Only callable by an address that currently has the admin role.
-        @param handlerAddress Address of handler resource will be set for.
-        @param resourceID ResourceID to be used when making deposits.
-        @param contractAddress Address of contract to be called when a deposit is made and a deposited is executed.
-     */
-    function adminSetGenericResource(
-        address handlerAddress,
-        bytes32 resourceID,
-        address contractAddress,
-        bytes4 depositFunctionSig,
-        bytes4 executeFunctionSig
-    ) external onlyAdmin {
-        _resourceIDToHandlerAddress[resourceID] = handlerAddress;
-        IGenericHandler handler = IGenericHandler(handlerAddress);
-        handler.setResource(resourceID, contractAddress, depositFunctionSig, executeFunctionSig);
+        IBridgeHandler(handlerAddress).setResource(resourceID, tokenAddress);
     }
 
     /**
         @notice Sets a resource as burnable for handler contracts that use the IERCHandler interface.
         @notice Only callable by an address that currently has the admin role.
-        @param handlerAddress Address of handler resource will be set for.
-        @param tokenAddress Address of contract to be called when a deposit is made and a deposited is executed.
+        @param resourceID ResourceID to be called to withdraw funds from
      */
-    function adminSetBurnable(address handlerAddress, address tokenAddress) external onlyAdmin {
-        IERCHandler handler = IERCHandler(handlerAddress);
-        handler.setBurnable(tokenAddress);
+    function adminSetBurnable(bytes32 resourceID) external onlyAdmin {
+        address handler = _resourceIDToHandlerAddress[resourceID];
+        require(handler != address(0), 'Invalid resourceID');
+        IBridgeHandler(handler).setBurnable(resourceID);
+    }
+
+
+    /**
+        @notice Returns a depositKey made of deposit data.
+        @param destinationChainID ID of chain deposit will be bridged to.
+        @param resourceID ResourceID used to find address of handler to be used for deposit.
+        @param data Additional data to be passed to specified handler.
+        @return Deposit Key:
+     */
+    function getDepositKey(uint8 originChainID, uint8 destinationChainID, uint64 depositNonce, bytes32 resourceID, bytes calldata data) external pure returns (bytes32) {
+        return _getDepositKey(originChainID, destinationChainID, depositNonce, resourceID, data);
     }
 
     /**
         @notice Returns a proposal.
-        @param originChainID Chain ID deposit originated from.
-        @param depositNonce ID of proposal generated by proposal's origin Bridge contract.
-        @param dataHash Hash of data to be provided when deposit proposal is executed.
+        @param depositKey see {_getDepositKey}.
         @return Proposal which consists of:
-        - _dataHash Hash of data to be provided when deposit proposal is executed.
+        - _status Current status of proposal.
         - _yesVotes Number of votes in favor of proposal.
         - _noVotes Number of votes against proposal.
-        - _status Current status of proposal.
+        - _proposedBlock Block when proposal started
      */
-    function getProposal(uint8 originChainID, uint64 depositNonce, bytes32 dataHash) external view returns (Proposal memory) {
-        uint72 nonceAndID = (uint72(depositNonce) << 8) | uint72(originChainID);
-        return _proposals[nonceAndID][dataHash];
+    function getProposal(bytes32 depositKey) external view returns (Proposal memory) {
+        return _proposals[depositKey];
     }
 
     /**
@@ -265,155 +258,190 @@ contract Bridge is Pausable, AccessControl, SafeMath {
     }
 
     /**
-        @notice Used to manually withdraw funds from ERC safes.
-        @param handlerAddress Address of handler to withdraw from.
-        @param tokenAddress Address of token to withdraw.
-        @param recipient Address to withdraw tokens to.
-        @param amountOrTokenID Either the amount of ERC20 tokens or the ERC721 token ID to withdraw.
+        @notice Used to manually release funds from safes.
+        @param resourceID ResourceID to be called to withdraw funds from
+        @param data Handler specific release data.
      */
-    function adminWithdraw(
-        address handlerAddress,
-        address tokenAddress,
-        address recipient,
-        uint256 amountOrTokenID
+    function adminRelease(
+        bytes32 resourceID,
+	bytes calldata data
     ) external onlyAdmin {
-        IERCHandler handler = IERCHandler(handlerAddress);
-        handler.withdraw(tokenAddress, recipient, amountOrTokenID);
+        address handler = _resourceIDToHandlerAddress[resourceID];
+        require(handler != address(0), 'Invalid resourceID');
+	IBridgeHandler(handler).release(resourceID, data);
     }
 
     /**
         @notice Initiates a transfer using a specified handler contract.
         @notice Only callable when Bridge is not paused.
-        @param destinationChainID ID of chain deposit will be bridged to.
-        @param resourceID ResourceID used to find address of handler to be used for deposit.
-        @param data Additional data to be passed to specified handler.
+        @param data {resourceId:32}{destinationChain:32}{executorLength:32}{executor:*32}.
         @notice Emits {Deposit} event.
      */
-    function deposit(uint8 destinationChainID, bytes32 resourceID, bytes calldata data) external payable whenNotPaused {
+    function deposit(bytes32 resourceID, uint8 destinationChainID, bytes calldata executor, bytes calldata data) external payable whenNotPaused {
         require(msg.value == _fee, "Incorrect fee supplied");
 
-        address handler = _resourceIDToHandlerAddress[resourceID];
-        require(handler != address(0), "resourceID not mapped to handler");
+	address handler = _resourceIDToHandlerAddress[resourceID];
+        require(handler != address(0), "ResourceID not mapped");
+
+        bytes memory executorPadded = bytes(executor);
+        if (executorPadded.length & 31 != 0) {
+            executorPadded = abi.encodePacked(new bytes(32 - (executor.length & 31)), executorPadded);
+        }
 
         uint64 depositNonce = ++_depositCounts[destinationChainID];
-        _depositRecords[depositNonce][destinationChainID] = data;
 
-        IDepositExecute depositHandler = IDepositExecute(handler);
-        depositHandler.deposit(resourceID, destinationChainID, depositNonce, msg.sender, data);
+        IBridgeHandler(handler).deposit(resourceID, msg.sender, data);
 
-        emit Deposit(destinationChainID, resourceID, depositNonce);
+        emit Deposit(
+            abi.decode(executorPadded, (bytes32)),
+            _getDepositKey(_chainID, destinationChainID, depositNonce, resourceID, data),
+            destinationChainID,
+            depositNonce,
+            resourceID,
+            abi.encodePacked(resourceID, uint256(destinationChainID), executor.length, executorPadded, data)
+        );
     }
 
     /**
         @notice When called, {msg.sender} will be marked as voting in favor of proposal.
         @notice Only callable by relayers when Bridge is not paused.
-        @param chainID ID of chain deposit originated from.
-        @param depositNonce ID of deposited generated by origin Bridge contract.
-        @param dataHash Hash of data provided when deposit was made.
+        @param depositKey Key generated when deposit was made.
         @notice Proposal must not have already been passed or executed.
         @notice {msg.sender} must not have already voted on proposal.
         @notice Emits {ProposalEvent} event with status indicating the proposal status.
         @notice Emits {ProposalVote} event.
      */
-    function voteProposal(uint8 chainID, uint64 depositNonce, bytes32 resourceID, bytes32 dataHash) external onlyRelayers whenNotPaused {
+    function voteProposal(bytes32 depositKey) external onlyRelayers whenNotPaused {
+	Proposal memory proposal = _proposals[depositKey];
 
-        uint72 nonceAndID = (uint72(depositNonce) << 8) | uint72(chainID);
-        Proposal storage proposal = _proposals[nonceAndID][dataHash];
+        require(proposal._status <= ProposalStatus.Active, "Proposal already processed");
+        require(!_hasVoted(proposal, msg.sender), "Already voted");
 
-        require(_resourceIDToHandlerAddress[resourceID] != address(0), "no handler for resourceID");
-        require(uint(proposal._status) <= 1, "proposal already passed/executed/cancelled");
-        require(!_hasVotedOnProposal[nonceAndID][dataHash][msg.sender], "relayer already voted");
-
-        if (uint(proposal._status) == 0) {
-            ++_totalProposals;
-            _proposals[nonceAndID][dataHash] = Proposal({
-                _resourceID : resourceID,
-                _dataHash : dataHash,
-                _yesVotes : new address[](1),
-                _noVotes : new address[](0),
+        if (proposal._status == ProposalStatus.Inactive) {
+            proposal = Proposal({
                 _status : ProposalStatus.Active,
-                _proposedBlock : block.number
-                });
+                _yesVotes : 0,
+                _yesVotesTotal : 0,
+                _proposedBlock : uint40(block.number) // Overflow is desired.
+            });
 
-            proposal._yesVotes[0] = msg.sender;
-            emit ProposalEvent(chainID, depositNonce, ProposalStatus.Active, resourceID, dataHash);
-        } else {
-            if (sub(block.number, proposal._proposedBlock) > _expiry) {
-                // if the number of blocks that has passed since this proposal was
-                // submitted exceeds the expiry threshold set, cancel the proposal
-                proposal._status = ProposalStatus.Cancelled;
-                emit ProposalEvent(chainID, depositNonce, ProposalStatus.Cancelled, resourceID, dataHash);
-            } else {
-                require(dataHash == proposal._dataHash, "datahash mismatch");
-                proposal._yesVotes.push(msg.sender);
+            emit ProposalEvent(depositKey, ProposalStatus.Active);
+        } else if (uint40(sub(block.number, proposal._proposedBlock)) > _expiry) {
+            // if the number of blocks that has passed since this proposal was
+            // submitted exceeds the expiry threshold set, cancel the proposal
+            proposal._status = ProposalStatus.Cancelled;
 
-
-            }
-
+            emit ProposalEvent(depositKey, ProposalStatus.Cancelled);
         }
-        if (proposal._status != ProposalStatus.Cancelled) {
-            _hasVotedOnProposal[nonceAndID][dataHash][msg.sender] = true;
-            emit ProposalVote(chainID, depositNonce, proposal._status, resourceID);
 
-            // If _depositThreshold is set to 1, then auto finalize
-            // or if _relayerThreshold has been exceeded
-            if (_relayerThreshold <= 1 || proposal._yesVotes.length >= _relayerThreshold) {
+        if (proposal._status != ProposalStatus.Cancelled) {
+            proposal._yesVotes = uint200(proposal._yesVotes | _relayerBit(msg.sender));
+            proposal._yesVotesTotal++; // TODO: check if bit counting is cheaper.
+
+            emit ProposalVote(depositKey, proposal._status);
+
+            // Finalize if _relayerThreshold has been reached
+            if (proposal._yesVotesTotal >= _relayerThreshold) {
                 proposal._status = ProposalStatus.Passed;
 
-                emit ProposalEvent(chainID, depositNonce, ProposalStatus.Passed, resourceID, dataHash);
+                emit ProposalEvent(depositKey, ProposalStatus.Passed);
             }
         }
-
+        _proposals[depositKey] = proposal;
     }
 
     /**
-        @notice Executes a deposit proposal that is considered passed using a specified handler contract.
-        @notice Only callable by relayers when Bridge is not paused.
-        @param chainID ID of chain deposit originated from.
-        @param depositNonce ID of deposited generated by origin Bridge contract.
-        @param dataHash Hash of data originally provided when deposit was made.
+        @notice Cancel a proposal.
+        @notice Only callable by relayers and admin.
+        @param depositKey Key generated when deposit was made.
         @notice Proposal must be past expiry threshold.
         @notice Emits {ProposalEvent} event with status {Cancelled}.
      */
-    function cancelProposal(uint8 chainID, uint64 depositNonce, bytes32 dataHash) public onlyAdminOrRelayer {
-        uint72 nonceAndID = (uint72(depositNonce) << 8) | uint72(chainID);
-        Proposal storage proposal = _proposals[nonceAndID][dataHash];
+    function cancelProposal(bytes32 depositKey) public onlyAdminOrRelayer {
+        Proposal storage proposal = _proposals[depositKey];
 
         require(proposal._status != ProposalStatus.Cancelled, "Proposal already cancelled");
         require(sub(block.number, proposal._proposedBlock) > _expiry, "Proposal not at expiry threshold");
 
         proposal._status = ProposalStatus.Cancelled;
-        emit ProposalEvent(chainID, depositNonce, ProposalStatus.Cancelled, proposal._resourceID, proposal._dataHash);
-
+        emit ProposalEvent(depositKey, ProposalStatus.Cancelled);
     }
 
     /**
-        @notice Executes a deposit proposal that is considered passed using a specified handler contract.
+        @notice Executes a deposit proposal by emitting an {Execute} event.
         @notice Only callable by relayers when Bridge is not paused.
-        @param chainID ID of chain deposit originated from.
-        @param resourceID ResourceID to be used when making deposits.
-        @param depositNonce ID of deposited generated by origin Bridge contract.
-        @param data Data originally provided when deposit was made.
+        @param originChainID Chain ID where deposit was made.
+        @param depositNonce Nonce generated when deposit was made.
+        @param data {sig:96}{rId:32}{destId:32}{execLen:32}{executor:32*x}.
         @notice Proposal must have Passed status.
         @notice Hash of {data} must equal proposal's {dataHash}.
         @notice Emits {ProposalEvent} event with status {Executed}.
      */
-    function executeProposal(uint8 chainID, uint64 depositNonce, bytes calldata data, bytes32 resourceID) external onlyRelayers whenNotPaused {
-        address handler = _resourceIDToHandlerAddress[resourceID];
-        uint72 nonceAndID = (uint72(depositNonce) << 8) | uint72(chainID);
-        bytes32 dataHash = keccak256(abi.encodePacked(handler, data));
-        Proposal storage proposal = _proposals[nonceAndID][dataHash];
+    function executeProposal(
+        uint8 originChainID,
+        uint64 depositNonce,
+        bytes calldata data) external onlyRelayers whenNotPaused 
+    {
+        bytes32 resourceID = abi.decode(data[96:128], (bytes32));
+        uint8 destinationChainID = uint8(abi.decode(data[128:160], (uint256)));
+        // ExecutorLength is left padded to 32 byte
+        uint256 executorLength = (abi.decode(data[160:192], (uint256)) + 31) &~uint256(31);
 
-        require(proposal._status != ProposalStatus.Inactive, "proposal is not active");
-        require(proposal._status == ProposalStatus.Passed, "proposal already transferred");
-        require(dataHash == proposal._dataHash, "data doesn't match datahash");
+        bytes32 depositKey = _getDepositKey(
+          originChainID,
+          destinationChainID,
+          depositNonce,
+          resourceID,
+          bytes(data[192 + executorLength:])
+        );
+
+        Proposal storage proposal = _proposals[depositKey];
+
+        require(proposal._status == ProposalStatus.Passed, "Proposal not passed");
 
         proposal._status = ProposalStatus.Executed;
 
-        IDepositExecute depositHandler = IDepositExecute(_resourceIDToHandlerAddress[proposal._resourceID]);
-        depositHandler.executeProposal(proposal._resourceID, data);
+        // We only emit the first 32 byte
+        bytes32 executor = abi.decode(data[192:224], (bytes32));
 
-        emit ProposalEvent(chainID, depositNonce, proposal._status, proposal._resourceID, proposal._dataHash);
+        emit Execute(executor, depositKey, originChainID, destinationChainID, data);
+
+        emit ProposalEvent(depositKey, proposal._status);
+    }
+
+
+    /**
+        @notice Executes a message emitted from executeProposal.
+        @notice Only callable when Bridge is not paused.
+        @param data Signed data emitted in Execute event
+        {sig:96}{rId:32}{destId:32}{execLen:32}{executor:32}{handlerData}
+        @notice data has to be signed by a relayer (ecrecover).
+        @notice msg.sender has to be original depositor.
+        @notice chainId must match this chainId.
+        @notice there has to be a valid handler for the given resouceId.
+        @notice Emits {MessageExecuted} event.
+     */
+    function executeMessage(bytes calldata data) external whenNotPaused {
+        // extract sign
+        // validate signer (relayer)
+        // Extract header (depositor, chainId, resourceId) (abi.decode)
+        // Verify msg.sender == depositor
+        // Call the handler
+
+        bytes32 resourceID = abi.decode(data[96:128], (bytes32));
+        uint256 destinationChainID = abi.decode(data[128:160], (uint256));
+
+        require(destinationChainID == uint256(_chainID));
+
+        uint256 executorLength = abi.decode(data[160:192], (uint256));
+        require(executorLength == 20, 'Invalid address length');
+        address executor = abi.decode(data[192:224], (address));
+        require(executor == msg.sender, 'Only executor');
+
+        address handler = _resourceIDToHandlerAddress[resourceID];
+        require(handler != address(0), "ResourceID not mapped");
+
+        IBridgeHandler(handler).executeProposal(resourceID, bytes(data[224:]));
     }
 
     /**
@@ -428,4 +456,30 @@ contract Bridge is Pausable, AccessControl, SafeMath {
         }
     }
 
+    /**
+        @notice Create trackable depositKey
+     */
+    function _getDepositKey(
+      uint8 originChainID,
+      uint8 destinationChainID,
+      uint64 depositNonce,
+      bytes32 resourceID,
+      bytes memory data) private pure returns (bytes32)
+    {
+        return keccak256(abi.encodePacked(
+          originChainID,
+          destinationChainID,
+          depositNonce,
+          resourceID,
+          data
+        ));
+    }
+
+    function _relayerBit(address relayer) private view returns(uint256) {
+        return uint256(1) << sub(AccessControl.getRoleMemberIndex(RELAYER_ROLE, relayer), 1);
+    }
+
+    function _hasVoted(Proposal memory proposal, address relayer) private view returns(bool) {
+        return (_relayerBit(relayer) & uint(proposal._yesVotes)) > 0;
+    }
 }
