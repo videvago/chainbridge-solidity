@@ -7,6 +7,12 @@ import "./utils/SafeMath.sol";
 import "./interfaces/IBridgeHandler.sol";
 import "./interfaces/IBridge.sol";
 
+struct Signature {
+  bytes32 v;
+  bytes32 r;
+  bytes32 s;
+}
+
 /**
     @title Facilitates deposits, creation and votiing of deposit proposals, and deposit executions.
     @author ChainSafe Systems.
@@ -36,6 +42,8 @@ contract Bridge is Pausable, AccessControl, SafeMath {
     mapping(bytes32 => address) public _resourceIDToHandlerAddress;
     // depositKey => Proposal
     mapping(bytes32 => Proposal) public _proposals;
+    // depositKey => ProposalSignatures
+    mapping(bytes32 => Signature[]) private _signatures;
 
     event RelayerThresholdChanged(uint indexed newThreshold);
     event RelayerAdded(address indexed relayer);
@@ -85,15 +93,15 @@ contract Bridge is Pausable, AccessControl, SafeMath {
 
     function _onlyAdminOrRelayer() private view {
         require(hasRole(DEFAULT_ADMIN_ROLE, msg.sender) || hasRole(RELAYER_ROLE, msg.sender),
-            "sender is not relayer or admin");
+            "Only admin or relayer");
     }
 
     function _onlyAdmin() private view {
-        require(hasRole(DEFAULT_ADMIN_ROLE, msg.sender), "sender doesn't have admin role");
+        require(hasRole(DEFAULT_ADMIN_ROLE, msg.sender), "Only admin");
     }
 
     function _onlyRelayers() private view {
-        require(hasRole(RELAYER_ROLE, msg.sender), "sender doesn't have relayer role");
+        require(hasRole(RELAYER_ROLE, msg.sender), "Only relayer");
     }
 
     /**
@@ -311,7 +319,7 @@ contract Bridge is Pausable, AccessControl, SafeMath {
         @notice Emits {ProposalEvent} event with status indicating the proposal status.
         @notice Emits {ProposalVote} event.
      */
-    function voteProposal(bytes32 depositKey) external onlyRelayers whenNotPaused {
+    function voteProposal(bytes32 depositKey, bytes32 v, bytes32 r, bytes32 s) external onlyRelayers whenNotPaused {
 	Proposal memory proposal = _proposals[depositKey];
 
         require(proposal._status <= ProposalStatus.Active, "Proposal already processed");
@@ -337,6 +345,7 @@ contract Bridge is Pausable, AccessControl, SafeMath {
         if (proposal._status != ProposalStatus.Cancelled) {
             proposal._yesVotes = uint200(proposal._yesVotes | _relayerBit(msg.sender));
             proposal._yesVotesTotal++; // TODO: check if bit counting is cheaper.
+            _signatures[depositKey].push(Signature(v,r,s));
 
             emit ProposalVote(depositKey, proposal._status);
 
@@ -372,7 +381,7 @@ contract Bridge is Pausable, AccessControl, SafeMath {
         @notice Only callable by relayers when Bridge is not paused.
         @param originChainID Chain ID where deposit was made.
         @param depositNonce Nonce generated when deposit was made.
-        @param data {sig:96}{rId:32}{destId:32}{execLen:32}{executor:32*x}.
+        @param data {rId:32}{destId:32}{execLen:32}{executor:32*x}.
         @notice Proposal must have Passed status.
         @notice Hash of {data} must equal proposal's {dataHash}.
         @notice Emits {ProposalEvent} event with status {Executed}.
@@ -382,31 +391,52 @@ contract Bridge is Pausable, AccessControl, SafeMath {
         uint64 depositNonce,
         bytes calldata data) external onlyRelayers whenNotPaused 
     {
-        bytes32 resourceID = abi.decode(data[96:128], (bytes32));
-        uint8 destinationChainID = uint8(abi.decode(data[128:160], (uint256)));
-        // ExecutorLength is left padded to 32 byte
-        uint256 executorLength = (abi.decode(data[160:192], (uint256)) + 31) &~uint256(31);
+        uint8 destinationChainID;
+        bytes32 depositKey;
+        {
+            bytes32 resourceID = abi.decode(data[:32], (bytes32));
+            destinationChainID = uint8(abi.decode(data[32:64], (uint256)));
+            // ExecutorLength is left padded to 32 byte
+            uint256 executorLength = (abi.decode(data[64:96], (uint256)) + 31) & ~uint256(31);
 
-        bytes32 depositKey = _getDepositKey(
-          originChainID,
-          destinationChainID,
-          depositNonce,
-          resourceID,
-          bytes(data[192 + executorLength:])
-        );
+            depositKey = _getDepositKey(
+                originChainID,
+                destinationChainID,
+                depositNonce,
+                resourceID,
+                bytes(data[192 + executorLength:])
+            );
 
-        Proposal storage proposal = _proposals[depositKey];
+            Proposal storage proposal = _proposals[depositKey];
 
-        require(proposal._status == ProposalStatus.Passed, "Proposal not passed");
+            require(proposal._status == ProposalStatus.Passed, "Proposal not passed");
 
-        proposal._status = ProposalStatus.Executed;
+            proposal._status = ProposalStatus.Executed;
+
+            emit ProposalEvent(depositKey, proposal._status);
+        }
 
         // We only emit the first 32 byte
-        bytes32 executor = abi.decode(data[192:224], (bytes32));
+        bytes32 executor = abi.decode(data[96:128], (bytes32));
 
-        emit Execute(executor, depositKey, originChainID, destinationChainID, data);
+	// Add Signatures
+        bytes memory sigBytes = new bytes(0);
+        {
+            Signature[] storage signatures = _signatures[depositKey];
+            for (uint i = 0; i < signatures.length; ++i) {
+                sigBytes = abi.encodePacked(sigBytes, signatures[i].v, signatures[i].r, signatures[i].s);
+            }
+            // Cleanup
+            delete _signatures[depositKey];
+        }
 
-        emit ProposalEvent(depositKey, proposal._status);
+        emit Execute(
+            executor,
+            depositKey,
+            originChainID,
+            destinationChainID,
+            abi.encodePacked(sigBytes.length / 96, sigBytes, data)
+        );
     }
 
 
@@ -414,34 +444,54 @@ contract Bridge is Pausable, AccessControl, SafeMath {
         @notice Executes a message emitted from executeProposal.
         @notice Only callable when Bridge is not paused.
         @param data Signed data emitted in Execute event
-        {sig:96}{rId:32}{destId:32}{execLen:32}{executor:32}{handlerData}
-        @notice data has to be signed by a relayer (ecrecover).
-        @notice msg.sender has to be original depositor.
+        {numSig:32}{sigs:96}{rId:32}{destId:32}{execLen:32}{executor:32}{handlerData}
+        @param adminNoThreshold allow admin to execute without threshold
+        This could be required for pending messages if threshold is changed
+        @notice only executor is allowed to execute
+        @notice
         @notice chainId must match this chainId.
         @notice there has to be a valid handler for the given resouceId.
         @notice Emits {MessageExecuted} event.
      */
-    function executeMessage(bytes calldata data) external whenNotPaused {
-        // extract sign
-        // validate signer (relayer)
-        // Extract header (depositor, chainId, resourceId) (abi.decode)
-        // Verify msg.sender == depositor
-        // Call the handler
+    function executeMessage(bytes calldata data, uint256 adminNoThreshold) external whenNotPaused {
+        uint256 dataOffset = 32;
+        {
+	    // Number of signatures
+            uint256 numSignatures = abi.decode(data[:32], (uint256));
+            if (adminNoThreshold > 0)
+                _onlyAdmin();
+            else
+                require(numSignatures >= _relayerThreshold, 'Not enough signers');
 
-        bytes32 resourceID = abi.decode(data[96:128], (bytes32));
-        uint256 destinationChainID = abi.decode(data[128:160], (uint256));
+            // Verify signatures
+            bytes32 dataHash = keccak256(bytes(data[32 + numSignatures * 96:]));
+            uint256 signerMask = 0;
+            for (uint256 i = 0; i < numSignatures; ++i) {
+                (uint8 v, bytes32 r, bytes32 s) = abi.decode(data[dataOffset:dataOffset+96],(uint8, bytes32, bytes32));
+                if (v < 27) v += 27;
+                require(v == 27 || v == 28, 'Invalid sigature');
+
+                address relayer = ecrecover(dataHash, v, r, s);
+                require(hasRole(RELAYER_ROLE, relayer), 'Not a relayer');
+                require(signerMask != (signerMask |= _relayerBit(relayer)), 'Already signed');
+                dataOffset += 96;
+            }
+        }
+
+        bytes32 resourceID = abi.decode(data[dataOffset:dataOffset + 32], (bytes32));
+        uint256 destinationChainID = abi.decode(data[dataOffset + 32:dataOffset + 64], (uint256));
 
         require(destinationChainID == uint256(_chainID));
 
-        uint256 executorLength = abi.decode(data[160:192], (uint256));
+        uint256 executorLength = abi.decode(data[dataOffset + 64:dataOffset + 96], (uint256));
         require(executorLength == 20, 'Invalid address length');
-        address executor = abi.decode(data[192:224], (address));
+        address executor = abi.decode(data[dataOffset + 96:dataOffset + 128], (address));
         require(executor == msg.sender, 'Only executor');
 
         address handler = _resourceIDToHandlerAddress[resourceID];
         require(handler != address(0), "ResourceID not mapped");
 
-        IBridgeHandler(handler).executeProposal(resourceID, bytes(data[224:]));
+        IBridgeHandler(handler).executeProposal(resourceID, bytes(data[dataOffset + 128:]));
     }
 
     /**
@@ -475,10 +525,17 @@ contract Bridge is Pausable, AccessControl, SafeMath {
         ));
     }
 
+
+    /**
+        @notice Get bitmask bit of the current relayer
+     */
     function _relayerBit(address relayer) private view returns(uint256) {
         return uint256(1) << sub(AccessControl.getRoleMemberIndex(RELAYER_ROLE, relayer), 1);
     }
 
+    /**
+        @notice Check with help of bitmask if relayer has voted
+     */
     function _hasVoted(Proposal memory proposal, address relayer) private view returns(bool) {
         return (_relayerBit(relayer) & uint(proposal._yesVotes)) > 0;
     }
