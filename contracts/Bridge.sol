@@ -44,6 +44,8 @@ contract Bridge is Pausable, AccessControl, SafeMath {
     mapping(bytes32 => Proposal) public _proposals;
     // depositKey => ProposalSignatures
     mapping(bytes32 => Signature[]) private _signatures;
+    // depositKey => msgExecuted
+    mapping(bytes32 => uint256) private _executedMessages;
 
     event RelayerThresholdChanged(uint indexed newThreshold);
     event RelayerAdded(address indexed relayer);
@@ -300,13 +302,30 @@ contract Bridge is Pausable, AccessControl, SafeMath {
 
         IBridgeHandler(handler).deposit(resourceID, msg.sender, data);
 
+
+        bytes32 depositKey = _getDepositKey(
+          _chainID,
+          destinationChainID,
+          depositNonce,
+          resourceID,
+          data);
+
+        bytes memory enrichedData = abi.encodePacked(
+          depositKey,
+          resourceID,
+          uint256(_chainID),
+          uint256(destinationChainID),
+          executor.length,
+          executorPadded,
+          data);
+
         emit Deposit(
             abi.decode(executorPadded, (bytes32)),
-            _getDepositKey(_chainID, destinationChainID, depositNonce, resourceID, data),
+            depositKey,
             destinationChainID,
             depositNonce,
             resourceID,
-            abi.encodePacked(resourceID, uint256(destinationChainID), executor.length, executorPadded, data)
+            enrichedData
         );
     }
 
@@ -379,34 +398,15 @@ contract Bridge is Pausable, AccessControl, SafeMath {
     /**
         @notice Executes a deposit proposal by emitting an {Execute} event.
         @notice Only callable by relayers when Bridge is not paused.
-        @param originChainID Chain ID where deposit was made.
-        @param depositNonce Nonce generated when deposit was made.
-        @param data {rId:32}{destId:32}{execLen:32}{executor:32*x}.
+        @param data {dKey:32}{rId:32}{srcId:32}{destId:32}{execLen:32}{executor:32*x}.
         @notice Proposal must have Passed status.
-        @notice Hash of {data} must equal proposal's {dataHash}.
         @notice Emits {ProposalEvent} event with status {Executed}.
      */
     function executeProposal(
-        uint8 originChainID,
-        uint64 depositNonce,
         bytes calldata data) external onlyRelayers whenNotPaused 
     {
-        uint8 destinationChainID;
-        bytes32 depositKey;
+        bytes32 depositKey = abi.decode(data[:32], (bytes32));
         {
-            bytes32 resourceID = abi.decode(data[:32], (bytes32));
-            destinationChainID = uint8(abi.decode(data[32:64], (uint256)));
-            // ExecutorLength is left padded to 32 byte
-            uint256 executorLength = (abi.decode(data[64:96], (uint256)) + 31) & ~uint256(31);
-
-            depositKey = _getDepositKey(
-                originChainID,
-                destinationChainID,
-                depositNonce,
-                resourceID,
-                bytes(data[192 + executorLength:])
-            );
-
             Proposal storage proposal = _proposals[depositKey];
 
             require(proposal._status == ProposalStatus.Passed, "Proposal not passed");
@@ -416,10 +416,7 @@ contract Bridge is Pausable, AccessControl, SafeMath {
             emit ProposalEvent(depositKey, proposal._status);
         }
 
-        // We only emit the first 32 byte
-        bytes32 executor = abi.decode(data[96:128], (bytes32));
-
-	// Add Signatures
+	// Build signatures stack
         bytes memory sigBytes = new bytes(0);
         {
             Signature[] storage signatures = _signatures[depositKey];
@@ -431,10 +428,10 @@ contract Bridge is Pausable, AccessControl, SafeMath {
         }
 
         emit Execute(
-            executor,
+            abi.decode(data[160:192], (bytes32)), // executor
             depositKey,
-            originChainID,
-            destinationChainID,
+            uint8(abi.decode(data[64:96], (uint256))), // originChainId
+            uint8(abi.decode(data[96:128], (uint256))), // destinationChainId
             abi.encodePacked(sigBytes.length / 96, sigBytes, data)
         );
     }
@@ -444,11 +441,10 @@ contract Bridge is Pausable, AccessControl, SafeMath {
         @notice Executes a message emitted from executeProposal.
         @notice Only callable when Bridge is not paused.
         @param data Signed data emitted in Execute event
-        {numSig:32}{sigs:96}{rId:32}{destId:32}{execLen:32}{executor:32}{handlerData}
+        {numSig:32}{sigs:96}{dkey:32}{rId:32}{srcId:32}{destId:32}{execLen:32}{executor:32}{handlerData}
         @param adminNoThreshold allow admin to execute without threshold
         This could be required for pending messages if threshold is changed
         @notice only executor is allowed to execute
-        @notice
         @notice chainId must match this chainId.
         @notice there has to be a valid handler for the given resouceId.
         @notice Emits {MessageExecuted} event.
@@ -478,20 +474,27 @@ contract Bridge is Pausable, AccessControl, SafeMath {
             }
         }
 
-        bytes32 resourceID = abi.decode(data[dataOffset:dataOffset + 32], (bytes32));
-        uint256 destinationChainID = abi.decode(data[dataOffset + 32:dataOffset + 64], (uint256));
+        {
+            bytes32 depositKey = abi.decode(data[dataOffset:dataOffset + 32], (bytes32));
+            require(_executedMessages[depositKey] == 0, 'Already executed');
+            // Mark this message as executed.
+            _executedMessages[depositKey] = 1;
+        }
+        {
+            uint256 destinationChainID = abi.decode(data[dataOffset + 96:dataOffset + 128], (uint256));
+            require(destinationChainID == uint256(_chainID));
 
-        require(destinationChainID == uint256(_chainID));
+            uint256 executorLength = abi.decode(data[dataOffset + 128:dataOffset + 160], (uint256));
+            require(executorLength == 20, 'Invalid address length');
+            address executor = abi.decode(data[dataOffset + 160:dataOffset + 192], (address));
+            require(executor == msg.sender, 'Only executor');
+        }
 
-        uint256 executorLength = abi.decode(data[dataOffset + 64:dataOffset + 96], (uint256));
-        require(executorLength == 20, 'Invalid address length');
-        address executor = abi.decode(data[dataOffset + 96:dataOffset + 128], (address));
-        require(executor == msg.sender, 'Only executor');
-
+        bytes32 resourceID = abi.decode(data[dataOffset + 32:dataOffset + 64], (bytes32));
         address handler = _resourceIDToHandlerAddress[resourceID];
         require(handler != address(0), "ResourceID not mapped");
 
-        IBridgeHandler(handler).executeProposal(resourceID, bytes(data[dataOffset + 128:]));
+        IBridgeHandler(handler).executeProposal(resourceID, bytes(data[dataOffset + 192:]));
     }
 
     /**
