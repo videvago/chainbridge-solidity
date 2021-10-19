@@ -39,12 +39,14 @@ abstract contract BridgeHandler is IBridgeHandler {
         @dev {initialResourceIDs} and {initialContractAddresses} must have the same length (one resourceID for every address).
         Also, these arrays must be ordered in the way that {initialResourceIDs}[0] is the intended resourceID for {initialContractAddresses}[0].
      */
-    constructor(
+    function initialize(
         address bridgeAddress,
         bytes32[] memory initialResourceIDs,
         address[] memory initialContractAddresses,
         bytes32[] memory burnableResouceIDs
     ) public {
+        require(_bridgeAddress == address(0), 'Already initialized');
+
         _bridgeAddress = bridgeAddress;
 
         require(initialResourceIDs.length == initialContractAddresses.length, "Length mismatch");

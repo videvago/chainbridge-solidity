@@ -116,11 +116,13 @@ contract Bridge is Pausable, AccessControl, SafeMath {
         @notice Initializes Bridge, creates and grants {msg.sender} the admin role,
         creates and grants {initialRelayers} the relayer role.
         @param chainID ID of chain the Bridge contract exists on.
-        @param initialRelayers Addresses that should be initially granted the relayer role.
-        @param initialRelayerThreshold Number of votes needed for a deposit proposal to be considered passed.
+        @param fee Fee in native chain currency charged for every Deposit.
+        @param expiry Expiry in block number convention for proposal votes
      */
-    constructor (uint8 chainID, address[] memory initialRelayers, uint initialRelayerThreshold, uint256 fee, uint256 expiry) public {
-        _chainID = chainID;
+    function initialize(uint8 chainID, address[] calldata initialRelayers, uint initialRelayerThreshold, uint256 fee, uint256 expiry) external {
+        require(_chainID == 0, 'Already initialized');
+
+	_chainID = chainID;
         _relayerThreshold = initialRelayerThreshold;
         _fee = fee;
         _expiry = expiry;
@@ -132,6 +134,7 @@ contract Bridge is Pausable, AccessControl, SafeMath {
             grantRole(RELAYER_ROLE, initialRelayers[i]);
         }
     }
+
 
     /**
         @notice Returns true if {relayer} has the relayer role.

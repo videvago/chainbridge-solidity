@@ -10,16 +10,6 @@ import "./BridgeHandler.sol";
  */
 contract ERC20Handler is BridgeHandler, ERC20Safe {
     /**
-        @notice See {BridgeHandler-constructor}
-     */
-    constructor(
-        address _bridgeAddress,
-        bytes32[] memory initialResourceIDs,
-        address[] memory initialContractAddresses,
-        bytes32[] memory burnableResouceIDs
-    ) public BridgeHandler(_bridgeAddress, initialResourceIDs, initialContractAddresses, burnableResouceIDs){}
-
-    /**
         @notice A deposit is initiatied by making a deposit in the Bridge contract.
         @param resourceID the resourceID used for depositing
         @param depositer Address of account making the deposit in the Bridge contract.
