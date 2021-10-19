@@ -1,9 +1,6 @@
 pragma solidity 0.6.4;
 
-import "@openzeppelin/contracts/math/SafeMath.sol";
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/presets/ERC20PresetMinterPauser.sol";
-import "@openzeppelin/contracts/token/ERC20/ERC20Burnable.sol";
+import "./interfaces/IERC20BurnMint.sol";
 
 /**
     @title Manages deposited ERC20s.
@@ -11,8 +8,6 @@ import "@openzeppelin/contracts/token/ERC20/ERC20Burnable.sol";
     @notice This contract is intended to be used with ERC20Handler contract.
  */
 contract ERC20Safe {
-    using SafeMath for uint256;
-
     /**
         @notice Used to transfer tokens into the safe to fund proposals.
         @param tokenAddress Address of ERC20 to transfer.
@@ -20,7 +15,7 @@ contract ERC20Safe {
         @param amount Amount of tokens to transfer.
      */
     function fundERC20(address tokenAddress, address owner, uint256 amount) public {
-        IERC20 erc20 = IERC20(tokenAddress);
+        IERC20BurnMint erc20 = IERC20BurnMint(tokenAddress);
         _safeTransferFrom(erc20, owner, address(this), amount);
     }
 
@@ -32,7 +27,7 @@ contract ERC20Safe {
         @param amount Amount of tokens to transfer.
      */
     function lockERC20(address tokenAddress, address owner, address recipient, uint256 amount) internal {
-        IERC20 erc20 = IERC20(tokenAddress);
+        IERC20BurnMint erc20 = IERC20BurnMint(tokenAddress);
         _safeTransferFrom(erc20, owner, recipient, amount);
     }
 
@@ -43,7 +38,7 @@ contract ERC20Safe {
         @param amount Amount of tokens to transfer.
      */
     function releaseERC20(address tokenAddress, address recipient, uint256 amount) internal {
-        IERC20 erc20 = IERC20(tokenAddress);
+        IERC20BurnMint erc20 = IERC20BurnMint(tokenAddress);
         _safeTransfer(erc20, recipient, amount);
     }
 
@@ -54,7 +49,7 @@ contract ERC20Safe {
         @param amount Amount of token to mint.
      */
     function mintERC20(address tokenAddress, address recipient, uint256 amount) internal {
-        ERC20PresetMinterPauser erc20 = ERC20PresetMinterPauser(tokenAddress);
+        IERC20BurnMint erc20 = IERC20BurnMint(tokenAddress);
         erc20.mint(recipient, amount);
 
     }
@@ -66,7 +61,7 @@ contract ERC20Safe {
         @param amount Amount of tokens to burn.
      */
     function burnERC20(address tokenAddress, address owner, uint256 amount) internal {
-        ERC20Burnable erc20 = ERC20Burnable(tokenAddress);
+        IERC20BurnMint erc20 = IERC20BurnMint(tokenAddress);
         erc20.burnFrom(owner, amount);
     }
 
