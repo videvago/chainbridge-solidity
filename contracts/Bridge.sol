@@ -51,6 +51,7 @@ contract Bridge is Pausable, AccessControl, SafeMath {
     event RelayerAdded(address indexed relayer);
     event RelayerRemoved(address indexed relayer);
     event Deposit(
+        address indexed from,
 	bytes32 indexed executor,
         bytes32 depositKey,
         uint8 destinationChainID,
@@ -74,6 +75,11 @@ contract Bridge is Pausable, AccessControl, SafeMath {
         uint8   originChainID,
         uint8   destinationChainID,
         bytes   data
+    );
+
+    event Executed(
+        address indexed executor,
+        bytes32 indexed depositKey
     );
 
     bytes32 public constant RELAYER_ROLE = keccak256("RELAYER_ROLE");
@@ -257,6 +263,19 @@ contract Bridge is Pausable, AccessControl, SafeMath {
         return _proposals[depositKey];
     }
 
+
+    /**
+        @notice Returns message execution state
+        @param depositKeys Array of depositKeys the execution state to be queried
+	@return states Array of uint256 where != 0 is executed state
+     */
+    function getMessageExecutionState(bytes32[] calldata depositKeys) external view returns (uint256[] memory states) {
+        states = new uint256[](depositKeys.length);
+        for (uint i = 0; i < depositKeys.length; ++i) {
+            states[i] = _executedMessages[depositKeys[i]];
+        }
+    }
+
     /**
         @notice Changes deposit fee.
         @notice Only callable by admin.
@@ -290,9 +309,6 @@ contract Bridge is Pausable, AccessControl, SafeMath {
     function deposit(bytes32 resourceID, uint8 destinationChainID, bytes calldata executor, bytes calldata data) external payable whenNotPaused {
         require(msg.value == _fee, "Incorrect fee supplied");
 
-	address handler = _resourceIDToHandlerAddress[resourceID];
-        require(handler != address(0), "ResourceID not mapped");
-
         bytes memory executorPadded = bytes(executor);
         if (executorPadded.length & 31 != 0) {
             executorPadded = abi.encodePacked(new bytes(32 - (executor.length & 31)), executorPadded);
@@ -300,7 +316,12 @@ contract Bridge is Pausable, AccessControl, SafeMath {
 
         uint64 depositNonce = ++_depositCounts[destinationChainID];
 
-        IBridgeHandler(handler).deposit(resourceID, msg.sender, data);
+        {
+          address handler = _resourceIDToHandlerAddress[resourceID];
+          require(handler != address(0), "ResourceID not mapped");
+
+          IBridgeHandler(handler).deposit(resourceID, msg.sender, data);
+        }
 
 
         bytes32 depositKey = _getDepositKey(
@@ -320,6 +341,7 @@ contract Bridge is Pausable, AccessControl, SafeMath {
           data);
 
         emit Deposit(
+            msg.sender,
             abi.decode(executorPadded, (bytes32)),
             depositKey,
             destinationChainID,
@@ -469,7 +491,9 @@ contract Bridge is Pausable, AccessControl, SafeMath {
 
                 address relayer = ecrecover(dataHash, v, r, s);
                 require(hasRole(RELAYER_ROLE, relayer), 'Not a relayer');
-                require(signerMask != (signerMask |= _relayerBit(relayer)), 'Already signed');
+                uint256 oldSignerMask = signerMask;
+                require(oldSignerMask != (signerMask |= _relayerBit(relayer)), 'Already signed');
+
                 dataOffset += 96;
             }
         }
@@ -479,6 +503,8 @@ contract Bridge is Pausable, AccessControl, SafeMath {
             require(_executedMessages[depositKey] == 0, 'Already executed');
             // Mark this message as executed.
             _executedMessages[depositKey] = 1;
+
+            emit Executed(msg.sender, depositKey);
         }
         {
             uint256 destinationChainID = abi.decode(data[dataOffset + 96:dataOffset + 128], (uint256));
